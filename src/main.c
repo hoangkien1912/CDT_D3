@@ -9,8 +9,7 @@
 
 #define AUTO_OFF_TIME_MS    30000UL
 #define HEAD_CONFIRM_MS     200UL
-#define DEBOUNCE_MS         2U
-#define INPUT_COUNT         7U
+#define DEBOUNCE_SAMPLES    2U
 
 typedef enum {
     MAIN_SYS_OFF = 0,
@@ -24,9 +23,9 @@ typedef enum {
 } head_state_t;
 
 typedef enum {
-    IDLE = 0,
-    DOING,
-    WAIT_CLEAR
+    STATION_IDLE = 0,
+    STATION_RUNNING,
+    STATION_WAIT_CLEAR
 } station_state_t;
 
 typedef enum {
@@ -45,24 +44,27 @@ static timer_state_t   timer_state  = TM_RESET;
 static uint32_t head_started_at;
 static uint32_t timer_started_at;
 
-static uint8_t flag_30s;
+static uint8_t auto_off_requested;
 
-/* Thứ tự này cũng dùng để tra duration, chọn cảm biến và chuyển queue i + 1.
- * Các mảng bên dưới dùng cùng chỉ số i, nên không cần một struct lồng nhau. */
+/* Giữ FILL, CAP, LABEL liên tiếp để chuyển hàng đợi sang trạm i + 1. */
 enum { REJECT, FILL, CAP, LABEL, STATION_COUNT };
-/* Mỗi trạm có 3 giá trị riêng nhưng dùng chung chỉ số:
- * station_state[i]  = state hiện tại;
- * station_queue[i]  = số yêu cầu đang chờ;
- * station_started_at[i] = thời điểm output được bật.
- * Khởi tạo tĩnh đưa state về IDLE, queue và thời gian về 0. */
+/* Các mảng dùng chung chỉ số trạm; khởi tạo tĩnh về 0 (STATION_IDLE). */
 static station_state_t station_state[STATION_COUNT];
 static uint8_t station_queue[STATION_COUNT];
 static uint32_t station_started_at[STATION_COUNT];
 /* Loại: 1 s; chiết: 5 s; đóng nắp: 2 s; dán nhãn: 2 s. */
-static const uint16_t duration[STATION_COUNT] = { 1000, 5000, 2000, 2000 };
+static const uint16_t station_duration_ms[STATION_COUNT] = { 1000, 5000, 2000, 2000 };
 
-static uint8_t input_state[INPUT_COUNT];
-static uint8_t input_counter[INPUT_COUNT];
+/* Cùng thứ tự REJECT, FILL, CAP, LABEL; I2 dùng để chờ nhả sau khi loại. */
+static const gpio_input_t station_sensor[STATION_COUNT] = {
+    GPIO_INPUT_BOTTLE_LOWER,
+    GPIO_INPUT_FILL_POSITION,
+    GPIO_INPUT_CAP_POSITION,
+    GPIO_INPUT_LABEL_POSITION
+};
+
+static uint8_t input_state[GPIO_INPUT_COUNT];
+static uint8_t input_counter[GPIO_INPUT_COUNT];
 static uint32_t last_sample_ms;
 
 #define I0_START   (input_state[GPIO_INPUT_START])
@@ -77,7 +79,6 @@ static uint32_t last_sample_ms;
 static void hardware_setup(void);
 static void timer1_init(void);
 
-
 static uint32_t millis_now(void)
 {
     uint32_t now;
@@ -89,7 +90,7 @@ static uint32_t millis_now(void)
     return now;
 }
 
-
+/* Xác nhận thay đổi sau hai mẫu ở hai tick khác nhau, không lấy bù tick. */
 static void inputs_update(uint32_t now)
 {
     uint8_t i;
@@ -99,12 +100,12 @@ static void inputs_update(uint32_t now)
     }
     last_sample_ms = now;
 
-    for (i = 0; i < INPUT_COUNT; i++) {
+    for (i = 0; i < GPIO_INPUT_COUNT; i++) {
         uint8_t raw = gpio_read_input((gpio_input_t)i);
 
         if (raw == input_state[i]) {
             input_counter[i] = 0;
-        } else if (++input_counter[i] >= DEBOUNCE_MS) {
+        } else if (++input_counter[i] >= DEBOUNCE_SAMPLES) {
             input_state[i] = raw;
             input_counter[i] = 0;
         }
@@ -113,14 +114,14 @@ static void inputs_update(uint32_t now)
 
 static void queue_push(uint8_t *queue)
 {
-    if (*queue < 255U) {
+    if (*queue < UINT8_MAX) {
         (*queue)++;
     }
 }
 
 static void outputs_off(void)
 {
-    for (uint8_t i = 0; i <= GPIO_OUTPUT_CHECK_I2_I3; i++) {
+    for (uint8_t i = 0; i < GPIO_OUTPUT_COUNT; i++) {
         gpio_write_output((gpio_output_t)i, 0);
     }
 }
@@ -128,13 +129,13 @@ static void outputs_off(void)
 static void system_off(void)
 {
     outputs_off();
-    main_state   = MAIN_SYS_OFF;
-    head_state   = HEAD_IDLE;
+    main_state = MAIN_SYS_OFF;
+    head_state = HEAD_IDLE;
 
-    timer_state  = TM_RESET;
-    flag_30s     = 0;
+    timer_state = TM_RESET;
+    auto_off_requested = 0;
     for (uint8_t i = 0; i < STATION_COUNT; i++) {
-        station_state[i] = IDLE;
+        station_state[i] = STATION_IDLE;
         station_queue[i] = 0;
         station_started_at[i] = 0;
     }
@@ -153,27 +154,26 @@ static void main_fsm(void)
         break;
 
     case MAIN_SYS_ON:
-        if (I1_STOP || flag_30s) {
+        if (I1_STOP || auto_off_requested) {
             system_off();
         }
         break;
     }
 }
 
-
 static void timer_fsm(uint32_t now)
 {
     if (!SYS_ON) {
         /* Khi tắt hệ thống, không tích lũy thời gian vắng chai. */
         timer_state = TM_RESET;
-        flag_30s = 0;
+        auto_off_requested = 0;
         return;
     }
 
     switch (timer_state) {
     case TM_RESET:
         /* Bắt đầu một khoảng đếm mới khi cả hai cảm biến đều nhả. */
-        flag_30s = 0;
+        auto_off_requested = 0;
         if (!I2 && !I3) {
             timer_started_at = now;
             timer_state = TM_COUNTING;
@@ -185,7 +185,7 @@ static void timer_fsm(uint32_t now)
         if (I2 || I3) {
             timer_state = TM_RESET;
         } else if ((uint32_t)(now - timer_started_at) >= AUTO_OFF_TIME_MS) {
-            flag_30s = 1;
+            auto_off_requested = 1;
             timer_state = TM_TRIGGER;
         }
         break;
@@ -211,7 +211,7 @@ static void head_fsm(uint32_t now)
         if ((uint32_t)(now - head_started_at) >= HEAD_CONFIRM_MS) {
             /* Chai đạt nhưng queue FILL đầy sẽ không được xếp hoặc chuyển sang loại.
              * LED chỉ bật khi xếp FILL thành công và I4 chưa tác động. */
-            if ((I2 && I3) && station_queue[FILL] < 255U) {
+            if ((I2 && I3) && station_queue[FILL] < UINT8_MAX) {
                 queue_push(&station_queue[FILL]);
                 gpio_write_output(GPIO_OUTPUT_CHECK_I2_I3, !I4);
             } else if (I2 && !I3) {
@@ -229,7 +229,6 @@ static void head_fsm(uint32_t now)
         break;
     }
 }
-
 
 static void station_output(uint8_t index, uint8_t active)
 {
@@ -251,43 +250,34 @@ static void station_output(uint8_t index, uint8_t active)
     }
 }
 
-
 static void stations_update(uint32_t now)
 {
     for (uint8_t i = 0; i < STATION_COUNT; i++) {
-        uint8_t sensor = 0;
-        if (i == REJECT) {
-            sensor = I2;
-        } else if (i == FILL) {
-            sensor = I4;
-        } else if (i == CAP) {
-            sensor = input_state[GPIO_INPUT_CAP_POSITION];
-        } else if (i == LABEL) {
-            sensor = input_state[GPIO_INPUT_LABEL_POSITION];
-        }
+        uint8_t sensor = input_state[station_sensor[i]];
+
         switch (station_state[i]) {
-        case IDLE:
+        case STATION_IDLE:
             if (SYS_ON && station_queue[i] && (i == REJECT || sensor)) {
                 station_queue[i]--;
                 station_output(i, 1);
                 station_started_at[i] = now;
-                station_state[i] = DOING;
+                station_state[i] = STATION_RUNNING;
             }
             break;
-        case DOING:
-            if ((uint32_t)(now - station_started_at[i]) >= duration[i]) {
+        case STATION_RUNNING:
+            if ((uint32_t)(now - station_started_at[i]) >= station_duration_ms[i]) {
                 station_output(i, 0);
                 if (i == FILL || i == CAP) {
                     queue_push(&station_queue[i + 1]);
                 }
-                station_state[i] = WAIT_CLEAR;
+                station_state[i] = STATION_WAIT_CLEAR;
             }
             break;
-        case WAIT_CLEAR:
-            /* Phải thấy cảm biến nhả mới về IDLE; việc bắt đầu yêu cầu tiếp
+        case STATION_WAIT_CLEAR:
+            /* Phải thấy cảm biến nhả mới về STATION_IDLE; việc bắt đầu yêu cầu tiếp
              * chỉ diễn ra ở lần gọi stations_update() sau. */
             if (!sensor) {
-                station_state[i] = IDLE;
+                station_state[i] = STATION_IDLE;
             }
             break;
         }
@@ -314,7 +304,6 @@ int main(void)
     }
 }
 
-
 static void hardware_setup(void)
 {
     gpio_init();
@@ -334,7 +323,6 @@ static void timer1_init(void)
     TIMSK1 = _BV(OCIE1A);
     TCCR1B |= _BV(CS11) | _BV(CS10);
 }
-
 
 ISR(TIMER1_COMPA_vect)
 {
