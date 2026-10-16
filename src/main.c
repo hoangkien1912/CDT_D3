@@ -1,11 +1,3 @@
-/*
- * Điều khiển dây chuyền bằng các máy trạng thái (FSM), không dùng delay.
- * Luồng chai: kiểm tra I2/I3 -> loại chai hoặc chiết rót -> đóng nắp -> dán nhãn.
- * Mỗi trạm có state, số yêu cầu chờ và mốc thời gian riêng; vòng lặp lần lượt
- * cập nhật các trạm nên chúng có thể hoạt động đồng thời mà không chờ nhau.
- * Chân input tác động ở mức điện 0, nhưng gpio_read_input() đảo lại thành
- * logic 1 = đang tác động. Các ký hiệu I0..I4 bên dưới đã qua chống dội.
- */
 #ifndef F_CPU
 #define F_CPU 16000000UL
 #endif
@@ -15,49 +7,34 @@
 #include <avr/interrupt.h>
 #include <util/atomic.h>
 
-/* Đơn vị thời gian là ms. DEBOUNCE_MS thực tế là số mẫu khác trạng thái cũ
- * liên tiếp (20 mẫu); chỉ tương đương khoảng 20 ms nếu lấy mẫu đều mỗi ms. */
 #define AUTO_OFF_TIME_MS    30000UL
 #define HEAD_CONFIRM_MS     200UL
 #define DEBOUNCE_MS         2U
 #define INPUT_COUNT         7U
 
 typedef enum {
-    /* Tất cả output đã tắt; chờ START và STOP không tác động. */
     MAIN_SYS_OFF = 0,
-    /* Băng tải chạy, cho phép nhận chai; STOP hoặc cờ 30 s sẽ tắt hệ thống. */
     MAIN_SYS_ON
 } main_state_t;
 
 typedef enum {
-    /* Chờ I2 hoặc I3 tác động khi hệ thống đang bật. */
     HEAD_IDLE = 0,
-    /* Chờ đủ 200 ms rồi xét mức I2/I3 hiện tại để phân loại. */
     HEAD_CONFIRM,
-    /* Đã phân loại; chờ cả I2 và I3 nhả để không đếm lặp cùng một chai. */
     HEAD_WAIT_CLEAR
 } head_state_t;
 
 typedef enum {
-    /* Chờ yêu cầu trong queue và cảm biến vị trí (trạm loại không cần vị trí). */
     IDLE = 0,
-    /* Output trạm đang bật; giữ đến khi đủ duration tương ứng. */
     DOING,
-    /* Output đã tắt; chờ cảm biến nhả trước khi nhận yêu cầu tiếp theo. */
     WAIT_CLEAR
 } station_state_t;
 
 typedef enum {
-    /* Xóa cờ hết giờ; chỉ bắt đầu đếm khi cả I2 và I3 không tác động. */
     TM_RESET = 0,
-    /* Đếm thời gian I2/I3 cùng vắng; một cảm biến tác động sẽ hủy lần đếm. */
     TM_COUNTING,
-    /* Đã đủ 30 s; giữ cờ cho main_fsm() xử lý tắt hệ thống. */
     TM_TRIGGER
 } timer_state_t;
 
-/* ISR ghi, chương trình chính đọc: volatile buộc truy cập giá trị thực.
- * Biến static mặc định bằng 0; đọc 32 bit trên AVR 8 bit cần vùng atomic. */
 static volatile uint32_t system_millis;
 
 static main_state_t    main_state   = MAIN_SYS_OFF;
@@ -68,7 +45,6 @@ static timer_state_t   timer_state  = TM_RESET;
 static uint32_t head_started_at;
 static uint32_t timer_started_at;
 
-/* Tín hiệu hết 30 giây từ bộ đếm sang FSM bật/tắt hệ thống. */
 static uint8_t flag_30s;
 
 /* Thứ tự này cũng dùng để tra duration, chọn cảm biến và chuyển queue i + 1.
@@ -85,8 +61,6 @@ static uint32_t station_started_at[STATION_COUNT];
 /* Loại: 1 s; chiết: 5 s; đóng nắp: 2 s; dán nhãn: 2 s. */
 static const uint16_t duration[STATION_COUNT] = { 1000, 5000, 2000, 2000 };
 
-/* input_state: logic ổn định; input_counter: số mẫu liên tiếp khác logic đó.
- * last_sample_ms ngăn lấy mẫu lặp nhiều lần trong cùng một tick. */
 static uint8_t input_state[INPUT_COUNT];
 static uint8_t input_counter[INPUT_COUNT];
 static uint32_t last_sample_ms;
@@ -103,10 +77,7 @@ static uint32_t last_sample_ms;
 static void hardware_setup(void);
 static void timer1_init(void);
 
-/* ===== Các hàm hỗ trợ xử lý trạng thái ===== */
 
-/* Trả về ảnh chụp nhất quán của bộ đếm ms. Tạm khóa ngắt khi đọc đủ 4 byte,
- * tránh ISR tăng bộ đếm giữa chừng; sau đó khôi phục trạng thái ngắt ban đầu. */
 static uint32_t millis_now(void)
 {
     uint32_t now;
@@ -118,10 +89,7 @@ static uint32_t millis_now(void)
     return now;
 }
 
-/* Đọc và chống dội độc lập cho 7 input, tối đa một mẫu mỗi giá trị now.
- * Mẫu giống trạng thái ổn định: xóa bộ đếm. Mẫu khác: tăng bộ đếm;
- * đủ 20 mẫu khác liên tiếp mới chấp nhận trạng thái mới (cả bật lẫn nhả).
- * Nếu vòng lặp chậm và bỏ qua tick, hàm không lấy bù mẫu đã bỏ lỡ. */
+
 static void inputs_update(uint32_t now)
 {
     uint8_t i;
@@ -143,8 +111,6 @@ static void inputs_update(uint32_t now)
     }
 }
 
-/* Thêm một yêu cầu vào bộ đếm hàng chờ qua con trỏ.
- * Bão hòa ở 255: khi đầy, bỏ yêu cầu mới để tránh tràn uint8_t về 0. */
 static void queue_push(uint8_t *queue)
 {
     if (*queue < 255U) {
@@ -152,8 +118,6 @@ static void queue_push(uint8_t *queue)
     }
 }
 
-/* Tắt toàn bộ 8 output, gồm băng tải, các cơ cấu và LED xác nhận.
- * Vòng lặp dựa vào enum output liên tục từ 0 đến CHECK_I2_I3. */
 static void outputs_off(void)
 {
     for (uint8_t i = 0; i <= GPIO_OUTPUT_CHECK_I2_I3; i++) {
@@ -161,10 +125,6 @@ static void outputs_off(void)
     }
 }
 
-/* Dừng ngay các output và đưa các FSM về trạng thái ban đầu.
- * Xóa mọi yêu cầu đang chờ; chu trình đang chạy bị hủy, không được tiếp tục.
- * Mốc thời gian phân loại và bộ đếm được ghi lại khi bắt đầu chu trình mới.
- * Trạng thái input chống dội và đồng hồ ms vẫn được giữ. */
 static void system_off(void)
 {
     outputs_off();
@@ -182,13 +142,10 @@ static void system_off(void)
 
 /* ===== Các máy trạng thái điều khiển dây chuyền ===== */
 
-/* FSM bật/tắt tổng, dùng trạng thái nút nhấn sau chống dội (không bắt cạnh).
- * Vì vậy giữ START khi STOP đã nhả có thể làm hệ thống khởi động lại. */
 static void main_fsm(void)
 {
     switch (main_state) {
     case MAIN_SYS_OFF:
-        /* STOP ưu tiên: chỉ bật băng tải nếu START có và STOP không có. */
         if (I0_START && !I1_STOP) {
             gpio_write_output(GPIO_OUTPUT_CONVEYOR, 1);
             main_state = MAIN_SYS_ON;
@@ -196,7 +153,6 @@ static void main_fsm(void)
         break;
 
     case MAIN_SYS_ON:
-        /* Dừng do người vận hành hoặc do 30 s không thấy I2/I3. */
         if (I1_STOP || flag_30s) {
             system_off();
         }
@@ -204,10 +160,7 @@ static void main_fsm(void)
     }
 }
 
-/* FSM tự tắt sau 30 s liên tục không có tín hiệu ở I2 và I3.
- * Chỉ kiểm tra đầu vào dây chuyền, không kiểm tra trạm sau còn chai hay không.
- * Phép trừ uint32_t tính thời gian đã qua vẫn đúng khi đồng hồ quay vòng,
- * với điều kiện khoảng thời gian thực chưa vượt một chu kỳ bộ đếm. */
+
 static void timer_fsm(uint32_t now)
 {
     if (!SYS_ON) {
@@ -243,12 +196,6 @@ static void timer_fsm(uint32_t now)
     }
 }
 
-/* FSM phân loại chai theo tín hiệu tại thời điểm đủ 200 ms:
- * - I2 và I3 cùng tác động: xếp yêu cầu chiết nếu hàng chờ chưa đầy.
- * - Chỉ I2 tác động: xếp yêu cầu loại.
- * - I2 không tác động: không xếp yêu cầu nào.
- * Không ghi nhớ tín hiệu từng xuất hiện trong khoảng chờ.
- * Khi tắt hệ thống, trạng thái đã được reset trước khi xử lý phân loại. */
 static void head_fsm(uint32_t now)
 {
     switch (head_state) {
@@ -283,10 +230,7 @@ static void head_fsm(uint32_t now)
     }
 }
 
-/* Bật/tắt các cơ cấu theo chỉ số trạm; active khác 0 là bật.
- * REJECT: xi lanh loại; FILL: van + chặn chai; CAP: đầu đóng + chặn chai;
- * LABEL: bộ dán nhãn. Các cặp output được điều khiển chung một trạng thái.
- * Hàm không điều khiển băng tải hoặc LED; index ngoài 4 trạm không làm gì. */
+
 static void station_output(uint8_t index, uint8_t active)
 {
     switch (index) {
@@ -307,15 +251,10 @@ static void station_output(uint8_t index, uint8_t active)
     }
 }
 
-/* Cập nhật lần lượt cả 4 trạm với cùng mốc now, không chờ trạm nào hoàn tất.
- * Mỗi lần gọi, mỗi trạm chỉ xử lý một case theo state ở thời điểm vào switch.
- * Queue chỉ là số lượng yêu cầu, không lưu danh tính hay vị trí từng chai. */
+
 static void stations_update(uint32_t now)
 {
     for (uint8_t i = 0; i < STATION_COUNT; i++) {
-        /* Chọn cảm biến bằng từng tên rõ ràng để dễ đối chiếu sơ đồ dây:
-         * REJECT không có cảm biến vị trí riêng nên dùng I2;
-         * ba trạm còn lại dùng lần lượt I4, I5, I6. */
         uint8_t sensor = 0;
         if (i == REJECT) {
             sensor = I2;
@@ -328,8 +267,6 @@ static void stations_update(uint32_t now)
         }
         switch (station_state[i]) {
         case IDLE:
-            /* Có yêu cầu thì trạm loại chạy ngay; 3 trạm sau phải thấy chai
-             * ở cảm biến vị trí. Lấy một yêu cầu và ghi mốc bắt đầu bật. */
             if (SYS_ON && station_queue[i] && (i == REJECT || sensor)) {
                 station_queue[i]--;
                 station_output(i, 1);
@@ -338,9 +275,6 @@ static void stations_update(uint32_t now)
             }
             break;
         case DOING:
-            /* Giữ output đến đủ thời gian, kể cả khi cảm biến đã nhả.
-             * Chiết xong thêm queue đóng nắp; đóng nắp xong thêm queue dán.
-             * Trạm kế tiếp có thể nhận ngay trong lượt for này nếu đủ điều kiện. */
             if ((uint32_t)(now - station_started_at[i]) >= duration[i]) {
                 station_output(i, 0);
                 if (i == FILL || i == CAP) {
@@ -360,28 +294,19 @@ static void stations_update(uint32_t now)
     }
 }
 
-/* ===== Chương trình chính: setup một lần, cập nhật FSM liên tục ===== */
-
-/* Điểm vào chương trình: cấu hình GPIO, tắt output, tạo tick rồi bật ngắt.
- * Vòng lặp chạy liên tục; mọi khoảng chờ dùng mốc thời gian thay cho delay. */
 int main(void)
 {
     hardware_setup();
 
     while (1) {
-        /* Một ảnh chụp thời gian dùng chung cho tất cả xử lý trong lượt này. */
         uint32_t now = millis_now();
 
         inputs_update(now);
 
-        /* Timer chạy trước để main_fsm() nhận cờ hết 30 s ngay cùng lượt.
-         * Main chạy trước các trạm để lệnh STOP tắt/reset chúng trước cập nhật. */
         timer_fsm(now);
         main_fsm();
 
         head_fsm(now);
-        /* I4 tắt LED A2. Nếu I4 chưa tác động, LED giữ giá trị đã ghi dù
-         * I2/I3 đã nhả; system_off() cũng tắt LED khi dừng hệ thống. */
         if (I4) {
             gpio_write_output(GPIO_OUTPUT_CHECK_I2_I3, 0);
         }
@@ -389,9 +314,7 @@ int main(void)
     }
 }
 
-/* ===== Định nghĩa setup phần cứng và ngắt đồng hồ ===== */
 
-/* Khởi tạo một lần trước vòng lặp; chỉ bật ngắt khi phần cứng đã sẵn sàng. */
 static void hardware_setup(void)
 {
     gpio_init();
@@ -400,11 +323,6 @@ static void hardware_setup(void)
     sei();
 }
 
-/* Cấu hình Timer1 làm đồng hồ ms riêng của chương trình:
- * - CTC (WGM12): đếm từ 0 đến OCR1A rồi tự về 0.
- * - Prescaler 64: tại F_CPU = 16 MHz, timer chạy 250 kHz.
- * - OCR1A = 249: 250 nhịp tạo một ngắt, tức 1 ms.
- * Hàm chỉ bật nguồn ngắt Timer1; hardware_setup() bật ngắt toàn cục sau đó. */
 static void timer1_init(void)
 {
     TCCR1A = 0;
@@ -417,8 +335,7 @@ static void timer1_init(void)
     TCCR1B |= _BV(CS11) | _BV(CS10);
 }
 
-/* Ngắt so sánh A của Timer1: mỗi 1 ms chỉ tăng bộ đếm để ISR ngắn gọn.
- * Bộ đếm uint32_t tự quay về 0 sau khoảng 49,7 ngày. */
+
 ISR(TIMER1_COMPA_vect)
 {
     system_millis++;
